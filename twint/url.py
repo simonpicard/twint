@@ -1,211 +1,477 @@
-import datetime
-from sys import platform
+import sys, os, datetime
+from asyncio import (
+    get_event_loop,
+    TimeoutError,
+    ensure_future,
+    new_event_loop,
+    set_event_loop,
+)
+
+from . import datelock, feed, get, output, verbose, storage
+from .token import TokenExpiryException
+from . import token
+from .storage import db
+from .feed import NoMoreTweetsException
+
 import logging as logme
-from urllib.parse import urlencode
-from urllib.parse import quote
 
-mobile = "https://mobile.twitter.com"
-base = "https://api.twitter.com/2/search/adaptive.json"
+import time
 
-
-def _sanitizeQuery(_url, params):
-    _serialQuery = ""
-    _serialQuery = urlencode(params, quote_via=quote)
-    _serialQuery = _url + "?" + _serialQuery
-    return _serialQuery
+bearer = (
+    "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
 
 
-def _formatDate(date):
-    if "win" in platform:
-        return f'"{date.split()[0]}"'
+class Twint:
+    def __init__(self, config):
+        logme.debug(__name__ + ":Twint:__init__")
+        if config.Resume is not None and (
+            config.TwitterSearch or config.Followers or config.Following
+        ):
+            logme.debug(__name__ + ":Twint:__init__:Resume")
+            self.init = self.get_resume(config.Resume)
+        else:
+            self.init = -1
+
+        config.deleted = []
+        self.feed: list = [-1]
+        self.count = 0
+        self.user_agent = ""
+        self.config = config
+        self.config.Bearer_token = bearer
+        # TODO might have to make some adjustments for it to work with multi-treading
+        # USAGE : to get a new guest token simply do `self.token.refresh()`
+        self.token = token.Token(config)
+        self.token.refresh()
+        self.conn = db.Conn(config.Database)
+        self.d = datelock.Set(self.config.Until, self.config.Since)
+        verbose.Elastic(config.Elasticsearch)
+
+        if self.config.Store_object:
+            logme.debug(__name__ + ":Twint:__init__:clean_follow_list")
+            output._clean_follow_list()
+
+        if self.config.Pandas_clean:
+            logme.debug(__name__ + ":Twint:__init__:pandas_clean")
+            storage.panda.clean()
+
+    def get_resume(self, resumeFile):
+        if not os.path.exists(resumeFile):
+            return "-1"
+        with open(resumeFile, "r") as rFile:
+            _init = rFile.readlines()[-1].strip("\n")
+            return _init
+
+    async def Feed(self):
+        logme.debug(__name__ + ":Twint:Feed")
+        consecutive_errors_count = 0
+        while True:
+            # this will receive a JSON string, parse it into a `dict` and do the required stuff
+            try:
+                response = await get.RequestUrl(self.config, self.init)
+            except TokenExpiryException as e:
+                logme.debug(__name__ + "Twint:Feed:" + str(e))
+                self.token.refresh()
+                response = await get.RequestUrl(self.config, self.init)
+
+            if self.config.Debug:
+                print(
+                    response, file=open("twint-last-request.log", "w", encoding="utf-8")
+                )
+
+            self.feed = []
+            try:
+                if self.config.Favorites:
+                    self.feed, self.init = feed.MobileFav(response)
+                    favorite_err_cnt = 0
+                    if len(self.feed) == 0 and len(self.init) == 0:
+                        while (
+                            len(self.feed) == 0 or len(self.init) == 0
+                        ) and favorite_err_cnt < 5:
+                            self.user_agent = await get.RandomUserAgent(wa=False)
+                            response = await get.RequestUrl(
+                                self.config,
+                                self.init,
+                                headers=[("User-Agent", self.user_agent)],
+                            )
+                            self.feed, self.init = feed.MobileFav(response)
+                            favorite_err_cnt += 1
+                            time.sleep(1)
+                        if favorite_err_cnt == 5:
+                            print("Favorite page could not be fetched")
+                    if not self.count % 40:
+                        time.sleep(5)
+                elif self.config.Followers or self.config.Following:
+                    self.feed, self.init = feed.Follow(response)
+                    if not self.count % 40:
+                        time.sleep(5)
+                elif self.config.Profile or self.config.TwitterSearch:
+                    try:
+                        self.feed, self.init = feed.parse_tweets(self.config, response)
+                    except NoMoreTweetsException as e:
+                        logme.debug(__name__ + ":Twint:Feed:" + str(e))
+                        logme.warning("[!] " + str(e) + " Scraping will stop now.")
+                        logme.info(
+                            "found {} deleted tweets in this search.".format(
+                                len(self.config.deleted)
+                            )
+                        )
+                        break
+                break
+            except TimeoutError as e:
+                if self.config.Proxy_host.lower() == "tor":
+                    print("[?] Timed out, changing Tor identity...")
+                    if self.config.Tor_control_password is None:
+                        logme.critical(__name__ + ":Twint:Feed:tor-password")
+                        sys.stderr.write(
+                            "Error: config.Tor_control_password must be set for proxy auto-rotation!\r\n"
+                        )
+                        sys.stderr.write(
+                            "Info: What is it? See https://stem.torproject.org/faq.html#can-i-interact-with-tors"
+                            "-controller-interface-directly\r\n"
+                        )
+                        break
+                    else:
+                        get.ForceNewTorIdentity(self.config)
+                        continue
+                else:
+                    logme.critical(__name__ + ":Twint:Feed:" + str(e))
+                    print(str(e))
+                    break
+            except Exception as e:
+                if self.config.Profile or self.config.Favorites:
+                    print("[!] Twitter does not return more data, scrape stops here.")
+                    break
+
+                logme.critical(__name__ + ":Twint:Feed:noData" + str(e))
+                # Sometimes Twitter says there is no data. But it's a lie.
+                # raise
+                consecutive_errors_count += 1
+                if consecutive_errors_count < self.config.Retries_count:
+                    # skip to the next iteration if wait time does not satisfy limit constraints
+                    delay = round(
+                        consecutive_errors_count ** self.config.Backoff_exponent, 1
+                    )
+
+                    # if the delay is less than users set min wait time then replace delay
+                    if self.config.Min_wait_time > delay:
+                        delay = self.config.Min_wait_time
+
+                    sys.stderr.write("sleeping for {} secs\n".format(delay))
+                    time.sleep(delay)
+                    self.user_agent = await get.RandomUserAgent(wa=True)
+                    continue
+                logme.critical(__name__ + ":Twint:Feed:Tweets_known_error:" + str(e))
+                sys.stderr.write(str(e) + " [x] run.Feed")
+                sys.stderr.write(
+                    "[!] if you get this error but you know for sure that more tweets exist, please open an issue and "
+                    "we will investigate it!"
+                )
+                break
+        if self.config.Resume:
+            print(self.init, file=open(self.config.Resume, "a", encoding="utf-8"))
+
+    async def follow(self):
+        await self.Feed()
+        if self.config.User_full:
+            logme.debug(__name__ + ":Twint:follow:userFull")
+            self.count += await get.Multi(self.feed, self.config, self.conn)
+        else:
+            logme.debug(__name__ + ":Twint:follow:notUserFull")
+            for user in self.feed:
+                self.count += 1
+                username = user.find("a")["name"]
+                await output.Username(username, self.config, self.conn)
+
+    async def favorite(self):
+        logme.debug(__name__ + ":Twint:favorite")
+        await self.Feed()
+        favorited_tweets_list = []
+        for tweet in self.feed:
+            tweet_dict = {}
+            self.count += 1
+            try:
+                tweet_dict["data-item-id"] = tweet.find("div", {"class": "tweet-text"})[
+                    "data-id"
+                ]
+                t_url = tweet.find("span", {"class": "metadata"}).find("a")["href"]
+                tweet_dict["data-conversation-id"] = t_url.split("?")[0].split("/")[-1]
+                tweet_dict["username"] = (
+                    tweet.find("div", {"class": "username"})
+                    .text.replace("\n", "")
+                    .replace(" ", "")
+                )
+                tweet_dict["tweet"] = (
+                    tweet.find("div", {"class": "tweet-text"})
+                    .find("div", {"class": "dir-ltr"})
+                    .text
+                )
+                date_str = tweet.find("td", {"class": "timestamp"}).find("a").text
+                # test_dates = ["1m", "2h", "Jun 21, 2019", "Mar 12", "28 Jun 19"]
+                # date_str = test_dates[3]
+                if len(date_str) <= 3 and (
+                    date_str[-1] == "m" or date_str[-1] == "h"
+                ):  # 25m 1h
+                    dateu = str(datetime.date.today())
+                    tweet_dict["date"] = dateu
+                elif "," in date_str:  # Aug 21, 2019
+                    sp = date_str.replace(",", "").split(" ")
+                    date_str_formatted = sp[1] + " " + sp[0] + " " + sp[2]
+                    dateu = datetime.datetime.strptime(
+                        date_str_formatted, "%d %b %Y"
+                    ).strftime("%Y-%m-%d")
+                    tweet_dict["date"] = dateu
+                elif len(date_str.split(" ")) == 3:  # 28 Jun 19
+                    sp = date_str.split(" ")
+                    if len(sp[2]) == 2:
+                        sp[2] = "20" + sp[2]
+                    date_str_formatted = sp[0] + " " + sp[1] + " " + sp[2]
+                    dateu = datetime.datetime.strptime(
+                        date_str_formatted, "%d %b %Y"
+                    ).strftime("%Y-%m-%d")
+                    tweet_dict["date"] = dateu
+                else:  # Aug 21
+                    sp = date_str.split(" ")
+                    date_str_formatted = (
+                        sp[1] + " " + sp[0] + " " + str(datetime.date.today().year)
+                    )
+                    dateu = datetime.datetime.strptime(
+                        date_str_formatted, "%d %b %Y"
+                    ).strftime("%Y-%m-%d")
+                    tweet_dict["date"] = dateu
+
+                favorited_tweets_list.append(tweet_dict)
+
+            except Exception as e:
+                logme.critical(__name__ + ":Twint:favorite:favorite_field_lack")
+                print("shit: ", date_str, " ", str(e))
+
+        try:
+            self.config.favorited_tweets_list += favorited_tweets_list
+        except AttributeError:
+            self.config.favorited_tweets_list = favorited_tweets_list
+
+    async def profile(self):
+        await self.Feed()
+        logme.debug(__name__ + ":Twint:profile")
+        for tweet in self.feed:
+            self.count += 1
+            await output.Tweets(tweet, self.config, self.conn)
+
+    async def tweets(self):
+        await self.Feed()
+        # TODO : need to take care of this later
+        if self.config.Location:
+            logme.debug(__name__ + ":Twint:tweets:location")
+            self.count += await get.Multi(self.feed, self.config, self.conn)
+        else:
+            logme.debug(__name__ + ":Twint:tweets:notLocation")
+            for tweet in self.feed:
+                self.count += 1
+                await output.Tweets(tweet, self.config, self.conn)
+
+    async def main(self, callback=None):
+
+        task = ensure_future(self.run())  # Might be changed to create_task in 3.7+.
+
+        if callback:
+            task.add_done_callback(callback)
+
+        await task
+
+    async def run(self):
+        if self.config.TwitterSearch:
+            self.user_agent = await get.RandomUserAgent(wa=True)
+        else:
+            self.user_agent = await get.RandomUserAgent()
+
+        if self.config.User_id is not None and self.config.Username is None:
+            logme.debug(__name__ + ":Twint:main:user_id")
+            self.config.Username = await get.Username(
+                self.config.User_id, self.config.Bearer_token, self.config.Guest_token
+            )
+
+        if self.config.Username is not None and self.config.User_id is None:
+            logme.debug(__name__ + ":Twint:main:username")
+
+            self.config.User_id = await get.User(
+                self.config.Username, self.config, self.conn, True
+            )
+            if self.config.User_id is None:
+                raise ValueError(
+                    "Cannot find twitter account with name = " + self.config.Username
+                )
+
+        # TODO : will need to modify it to work with the new endpoints
+        if self.config.TwitterSearch and self.config.Since and self.config.Until:
+            logme.debug(__name__ + ":Twint:main:search+since+until")
+            while self.d.since < self.d.until:
+                self.config.Since = datetime.datetime.strftime(
+                    self.d.since, "%Y-%m-%d %H:%M:%S"
+                )
+                self.config.Until = datetime.datetime.strftime(
+                    self.d.until, "%Y-%m-%d %H:%M:%S"
+                )
+                if len(self.feed) > 0:
+                    await self.tweets()
+                else:
+                    logme.debug(__name__ + ":Twint:main:gettingNewTweets")
+                    break
+
+                if get.Limit(self.config.Limit, self.count):
+                    break
+        elif self.config.Lookup:
+            await self.Lookup()
+        else:
+            logme.debug(__name__ + ":Twint:main:not-search+since+until")
+            while True:
+                if len(self.feed) > 0:
+                    if self.config.Followers or self.config.Following:
+                        logme.debug(__name__ + ":Twint:main:follow")
+                        await self.follow()
+                    elif self.config.Favorites:
+                        logme.debug(__name__ + ":Twint:main:favorites")
+                        await self.favorite()
+                    elif self.config.Profile:
+                        logme.debug(__name__ + ":Twint:main:profile")
+                        await self.profile()
+                    elif self.config.TwitterSearch:
+                        logme.debug(__name__ + ":Twint:main:twitter-search")
+                        await self.tweets()
+                else:
+                    logme.debug(__name__ + ":Twint:main:no-more-tweets")
+                    break
+
+                # logging.info("[<] " + str(datetime.now()) + ':: run+Twint+main+CallingGetLimit2')
+                if get.Limit(self.config.Limit, self.count):
+                    logme.debug(__name__ + ":Twint:main:reachedLimit")
+                    break
+
+        if self.config.Count:
+            verbose.Count(self.count, self.config)
+
+    async def Lookup(self):
+        logme.debug(__name__ + ":Twint:Lookup")
+
+        try:
+            if self.config.User_id is not None and self.config.Username is None:
+                logme.debug(__name__ + ":Twint:Lookup:user_id")
+                self.config.Username = await get.Username(
+                    self.config.User_id,
+                    self.config.Bearer_token,
+                    self.config.Guest_token,
+                )
+            await get.User(
+                self.config.Username, self.config, db.Conn(self.config.Database)
+            )
+
+        except Exception as e:
+            logme.exception(__name__ + ":Twint:Lookup:Unexpected exception occurred.")
+            raise
+
+
+def run(config, callback=None):
+    logme.debug(__name__ + ":run")
     try:
-        return int(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").timestamp())
-    except ValueError:
-        return int(datetime.datetime.strptime(date, "%Y-%m-%d").timestamp())
+        get_event_loop()
+    except RuntimeError as e:
+        if "no current event loop" in str(e):
+            set_event_loop(new_event_loop())
+        else:
+            logme.exception(
+                __name__
+                + ":run:Unexpected exception while handling an expected RuntimeError."
+            )
+            raise
+    except Exception as e:
+        logme.exception(
+            __name__
+            + ":run:Unexpected exception occurred while attempting to get or create a new event loop."
+        )
+        raise
+
+    get_event_loop().run_until_complete(Twint(config).main(callback))
 
 
-async def Favorites(username, init):
+def Favorites(config):
     logme.debug(__name__ + ":Favorites")
-    url = f"{mobile}/{username}/favorites?lang=en"
+    config.Favorites = True
+    config.Following = False
+    config.Followers = False
+    config.Profile = False
+    config.TwitterSearch = False
+    run(config)
+    if config.Pandas_au:
+        storage.panda._autoget("tweet")
 
-    if init != "-1":
-        url += f"&max_id={init}"
 
-    return url
-
-
-async def Followers(username, init):
+def Followers(config):
     logme.debug(__name__ + ":Followers")
-    url = f"{mobile}/{username}/followers?lang=en"
+    config.Followers = True
+    config.Following = False
+    config.Profile = False
+    config.Favorites = False
+    config.TwitterSearch = False
+    run(config)
+    if config.Pandas_au:
+        storage.panda._autoget("followers")
+        if config.User_full:
+            storage.panda._autoget("user")
+    if config.Pandas_clean and not config.Store_object:
+        # storage.panda.clean()
+        output._clean_follow_list()
 
-    if init != "-1":
-        url += f"&cursor={init}"
 
-    return url
-
-
-async def Following(username, init):
+def Following(config):
     logme.debug(__name__ + ":Following")
-    url = f"{mobile}/{username}/following?lang=en"
-
-    if init != "-1":
-        url += f"&cursor={init}"
-
-    return url
-
-
-async def MobileProfile(username, init):
-    logme.debug(__name__ + ":MobileProfile")
-    url = f"{mobile}/{username}?lang=en"
-
-    if init != "-1":
-        url += f"&max_id={init}"
-
-    return url
+    config.Following = True
+    config.Followers = False
+    config.Profile = False
+    config.Favorites = False
+    config.TwitterSearch = False
+    run(config)
+    if config.Pandas_au:
+        storage.panda._autoget("following")
+        if config.User_full:
+            storage.panda._autoget("user")
+    if config.Pandas_clean and not config.Store_object:
+        # storage.panda.clean()
+        output._clean_follow_list()
 
 
-async def Search(config, init):
+def Lookup(config):
+    logme.debug(__name__ + ":Lookup")
+    config.Profile = False
+    config.Lookup = True
+    config.Favorites = False
+    config.FOllowing = False
+    config.Followers = False
+    config.TwitterSearch = False
+    run(config)
+    if config.Pandas_au:
+        storage.panda._autoget("user")
+
+
+def Profile(config):
+    logme.debug(__name__ + ":Profile")
+    config.Profile = True
+    config.Favorites = False
+    config.Following = False
+    config.Followers = False
+    config.TwitterSearch = False
+    run(config)
+    if config.Pandas_au:
+        storage.panda._autoget("tweet")
+
+
+def Search(config, callback=None):
     logme.debug(__name__ + ":Search")
-    url = base
-    tweet_count = 20
-    q = ""
-    params = [
-        # ('include_profile_interstitial_type', '1'),
-        # ('include_blocking', '1'),
-        # ('include_blocked_by', '1'),
-        # ('include_followed_by', '1'),
-        # ('include_want_retweets', '1'),
-        # ('include_mute_edge', '1'),
-        # ('include_can_dm', '1'),
-        ("include_can_media_tag", "1"),
-        # ('include_ext_has_nft_avatar', '1'),
-        # ('skip_status', '1'),
-        # ('cards_platform', 'Web-12'),
-        # ('include_cards', '1'),
-        ("include_ext_alt_text", "true"),
-        ("include_quote_count", "true"),
-        ("include_reply_count", "1"),
-        ("tweet_mode", "extended"),
-        ("include_entities", "true"),
-        # ("include_user_entities", "true"),
-        # ("include_ext_media_color", "true"),
-        ("include_ext_media_availability", "true"),
-        # ("include_ext_sensitive_media_warning", "true"),
-        ("send_error_codes", "true"),
-        ("simple_quoted_tweet", "true"),
-        ("count", tweet_count),
-        ("query_source", "typed_query"),
-        # ('pc', '1'),
-        # ("cursor", str(init)),
-        ("spelling_corrections", "1"),
-        ("ext", "mediaStats%2ChighlightedLabel"),
-        # ("ext", "mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CsuperFollowMetadata"),
-    ]
-    if str(init) != "-1":
-        params.append(("cursor", str(init)))
-    if not config.Popular_tweets:
-        params.append(("tweet_search_mode", "live"))
-    if config.Lang:
-        q += f" lang:{config.Lang}"
-    if config.Query:
-        q += f" from:{config.Query}"
-    if config.Username:
-        q += f" from:{config.Username}"
-    if config.Geo:
-        config.Geo = config.Geo.replace(" ", "")
-        q += f" geocode:{config.Geo}"
-    if config.Search:
-        q += f" {config.Search}"
-    if config.Year:
-        q += f" until:{config.Year}-1-1"
-    if config.Since:
-        q += f" since:{_formatDate(config.Since)}"
-    if config.Until:
-        q += f" until:{_formatDate(config.Until)}"
-    if config.Email:
-        q += ' "mail" OR "email" OR'
-        q += ' "gmail" OR "e-mail"'
-    if config.Phone:
-        q += ' "phone" OR "call me" OR "text me"'
-    if config.Verified:
-        q += " filter:verified"
-    if config.To:
-        q += f" to:{config.To}"
-    if config.All:
-        q += f" to:{config.All} OR from:{config.All} OR @{config.All}"
-    if config.Near:
-        q += f' near:"{config.Near}"'
-    if config.Images:
-        q += " filter:images"
-    if config.Videos:
-        q += " filter:videos"
-    if config.Media:
-        q += " filter:media"
-    if config.Replies:
-        q += " filter:replies"
-    # although this filter can still be used, but I found it broken in my preliminary testing, needs more testing
-    if config.Native_retweets:
-        q += " filter:nativeretweets"
-    if config.Min_likes:
-        q += f" min_faves:{config.Min_likes}"
-    if config.Min_retweets:
-        q += f" min_retweets:{config.Min_retweets}"
-    if config.Min_replies:
-        q += f" min_replies:{config.Min_replies}"
-    if config.Links == "include":
-        q += " filter:links"
-    elif config.Links == "exclude":
-        q += " exclude:links"
-    if config.Source:
-        q += f' source:"{config.Source}"'
-    if config.Members_list:
-        q += f" list:{config.Members_list}"
-    if config.Filter_retweets:
-        q += f" exclude:nativeretweets exclude:retweets"
-    if config.Custom_query:
-        q = config.Custom_query
-
-    q = q.strip()
-    params.append(("q", q))
-    _serialQuery = _sanitizeQuery(url, params)
-    return url, params, _serialQuery
-
-
-def SearchProfile(config, init=None):
-    logme.debug(__name__ + ":SearchProfile")
-    _url = "https://api.twitter.com/2/timeline/profile/{user_id}.json".format(
-        user_id=config.User_id
-    )
-    tweet_count = 100
-    params = [
-        # some of the fields are not required, need to test which ones aren't required
-        ("include_profile_interstitial_type", "1"),
-        ("include_blocking", "1"),
-        ("include_blocked_by", "1"),
-        ("include_followed_by", "1"),
-        ("include_want_retweets", "1"),
-        ("include_mute_edge", "1"),
-        ("include_can_dm", "1"),
-        ("include_can_media_tag", "1"),
-        ("skip_status", "1"),
-        ("cards_platform", "Web - 12"),
-        ("include_cards", "1"),
-        ("include_ext_alt_text", "true"),
-        ("include_quote_count", "true"),
-        ("include_reply_count", "1"),
-        ("tweet_mode", "extended"),
-        ("include_entities", "true"),
-        ("include_user_entities", "true"),
-        ("include_ext_media_color", "true"),
-        ("include_ext_media_availability", "true"),
-        ("send_error_codes", "true"),
-        ("simple_quoted_tweet", "true"),
-        ("include_tweet_replies", "true"),
-        ("count", tweet_count),
-        ("ext", "mediaStats%2ChighlightedLabel"),
-    ]
-
-    if type(init) == str:
-        params.append(("cursor", str(init)))
-    _serialQuery = _sanitizeQuery(_url, params)
-    return _url, params, _serialQuery
+    config.TwitterSearch = True
+    config.Favorites = False
+    config.Following = False
+    config.Followers = False
+    config.Profile = False
+    run(config, callback)
+    if config.Pandas_au:
+        storage.panda._autoget("tweet")
