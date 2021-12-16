@@ -115,7 +115,6 @@ async def Search(config, init):
         config.Geo = config.Geo.replace(" ", "")
         q += f" geocode:{config.Geo}"
     if config.Search:
-
         q += f" {config.Search}"
     if config.Year:
         q += f" until:{config.Year}-1-1"
@@ -169,7 +168,6 @@ async def Search(config, init):
     q = q.strip()
     params.append(("q", q))
     _serialQuery = _sanitizeQuery(url, params)
-    print(_serialQuery)
     return url, params, _serialQuery
 
 
