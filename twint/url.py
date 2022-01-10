@@ -19,7 +19,9 @@ def _formatDate(date):
     if "win" in platform:
         return f'"{date.split()[0]}"'
     try:
-        return int(datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").timestamp())
+        return int(
+            datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").timestamp()
+        )
     except ValueError:
         return int(datetime.datetime.strptime(date, "%Y-%m-%d").timestamp())
 
@@ -67,8 +69,8 @@ async def MobileProfile(username, init):
 async def Search(config, init):
     logme.debug(__name__ + ":Search")
     url = base
-    # tweet_count = 100 if not config.Limit else config.Limit
-    tweet_count = 20
+    tweet_count = 100
+    # tweet_count = 20
     q = ""
     params = [
         # ('include_profile_interstitial_type', '1'),
@@ -102,6 +104,8 @@ async def Search(config, init):
         ("ext", "mediaStats%2ChighlightedLabel"),
         # ("ext", "mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CsuperFollowMetadata"),
     ]
+    if config.Search:
+        q += f"{config.Search}"
     if str(init) != "-1":
         params.append(("cursor", str(init)))
     if not config.Popular_tweets:
@@ -115,9 +119,6 @@ async def Search(config, init):
     if config.Geo:
         config.Geo = config.Geo.replace(" ", "")
         q += f" geocode:{config.Geo}"
-    if config.Search:
-
-        q += f" {config.Search}"
     if config.Year:
         q += f" until:{config.Year}-1-1"
     if config.Since:
